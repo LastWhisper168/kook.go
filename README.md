@@ -2,6 +2,11 @@
 
 基于 [KOOK 开发者文档](https://developer.kookapp.cn/doc/reference) 的 Go 语言 SDK，提供完整的 API v3 接口封装。
 
+## 相关文档
+
+- [KOOK Go SDK API文档](https://blog.lastwhisper.net/article/16)
+- [KOOK API 错误代码文档](https://blog.lastwhisper.net/article/17)
+
 ## 功能特性
 
 - 完整的 KOOK API v3 支持
@@ -302,8 +307,3 @@ go run examples/advanced_bot/main.go
 
 这是 KOOK API 的非官方 SDK。与 KOOK 或其开发者没有关联、认可或赞助关系。 
 屎山代码，碰到问题请直接开喷，本人对项目状态敏感，打个喷嚏就知道哪里坏了，会第一时间修复并更新。
-
-## 相关文档
-
-- [KOOK Go SDK API文档](https://blog.lastwhisper.net/article/16)
-- [KOOK API 错误代码文档](https://blog.lastwhisper.net/article/17)
