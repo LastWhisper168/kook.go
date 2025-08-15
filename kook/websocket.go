@@ -19,16 +19,22 @@ type EventHandler func(*Event)
 
 // WebSocketClient WebSocket客户端
 type WebSocketClient struct {
-	client        *Client
-	conn          *websocket.Conn
-	eventHandlers map[int][]EventHandler
-	mu            sync.RWMutex
-	ctx           context.Context
-	cancel        context.CancelFunc
-	compress      bool
-	sn            int
-	sessionID     string
+	client          *Client
+	conn            *websocket.Conn
+	eventHandlers   map[int][]EventHandler
+	mu              sync.RWMutex
+	ctx             context.Context
+	cancel          context.CancelFunc
+	compress        bool
+	sn              int
+	sessionID       string
 	heartbeatTicker *time.Ticker
+	gatewayURL      string
+	reconnectCount  int
+	maxReconnects   int
+	reconnectDelay  time.Duration
+	isConnected     bool
+	connMu          sync.RWMutex
 }
 
 // WebSocketMessage WebSocket消息结构
@@ -62,25 +68,27 @@ type ResumeMessage struct {
 
 // 信令类型常量
 const (
-	SignalEvent     = 0  // 事件
-	SignalHello     = 1  // 服务端发送，客户端接收，代表连接成功
-	SignalPing      = 2  // 服务端发送，客户端接收，代表ping
-	SignalPong      = 3  // 客户端发送，服务端接收，代表pong
-	SignalResume    = 4  // 客户端发送，服务端接收，代表重连
-	SignalReconnect = 5  // 服务端发送，客户端接收，代表需要重连
-	SignalResumeAck = 6  // 服务端发送，客户端接收，代表重连成功
+	SignalEvent     = 0 // 事件
+	SignalHello     = 1 // 服务端发送，客户端接收，代表连接成功
+	SignalPing      = 2 // 双向：服务端ping客户端，客户端也可以ping服务端
+	SignalPong      = 3 // 双向：ping的响应
+	SignalResume    = 4 // 客户端发送，服务端接收，代表重连
+	SignalReconnect = 5 // 服务端发送，客户端接收，代表需要重连
+	SignalResumeAck = 6 // 服务端发送，客户端接收，代表重连成功
 )
 
 // NewWebSocketClient 创建新的WebSocket客户端
 func NewWebSocketClient(client *Client, compress bool) *WebSocketClient {
 	ctx, cancel := context.WithCancel(context.Background())
-	
+
 	return &WebSocketClient{
-		client:        client,
-		eventHandlers: make(map[int][]EventHandler),
-		ctx:           ctx,
-		cancel:        cancel,
-		compress:      compress,
+		client:         client,
+		eventHandlers:  make(map[int][]EventHandler),
+		ctx:            ctx,
+		cancel:         cancel,
+		compress:       compress,
+		maxReconnects:  10,
+		reconnectDelay: 5 * time.Second,
 	}
 }
 
@@ -88,35 +96,70 @@ func NewWebSocketClient(client *Client, compress bool) *WebSocketClient {
 func (ws *WebSocketClient) OnEvent(eventType int, handler EventHandler) {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
-	
+
 	ws.eventHandlers[eventType] = append(ws.eventHandlers[eventType], handler)
 }
 
 // Connect 连接到WebSocket网关
 func (ws *WebSocketClient) Connect() error {
+	return ws.connectWithRetry()
+}
+
+// connectWithRetry 带重试的连接
+func (ws *WebSocketClient) connectWithRetry() error {
+	for attempts := 0; attempts <= ws.maxReconnects; attempts++ {
+		err := ws.doConnect()
+		if err == nil {
+			ws.reconnectCount = 0
+			return nil
+		}
+
+		ws.client.logger.WithError(err).Errorf("WebSocket连接失败，尝试 %d/%d", attempts+1, ws.maxReconnects+1)
+
+		if attempts < ws.maxReconnects {
+			select {
+			case <-ws.ctx.Done():
+				return ws.ctx.Err()
+			case <-time.After(ws.reconnectDelay * time.Duration(attempts+1)):
+				// 指数退避
+			}
+		}
+	}
+
+	return fmt.Errorf("WebSocket连接失败，已达到最大重试次数")
+}
+
+// doConnect 执行实际连接
+func (ws *WebSocketClient) doConnect() error {
 	// 获取网关信息
 	compress := 0
 	if ws.compress {
 		compress = 1
 	}
-	
+
 	gateway, err := ws.client.Gateway.GetGateway(compress)
 	if err != nil {
 		return fmt.Errorf("获取网关信息失败: %w", err)
 	}
+
+	ws.gatewayURL = gateway.URL
 
 	// 创建WebSocket连接
 	header := http.Header{}
 	header.Set("Authorization", fmt.Sprintf("%s %s", ws.client.tokenType, ws.client.token))
 
 	ws.client.logger.Infof("连接到WebSocket网关: %s", gateway.URL)
-	
+
 	conn, _, err := websocket.DefaultDialer.Dial(gateway.URL, header)
 	if err != nil {
 		return fmt.Errorf("WebSocket连接失败: %w", err)
 	}
 
+	ws.connMu.Lock()
 	ws.conn = conn
+	ws.isConnected = true
+	ws.connMu.Unlock()
+
 	ws.client.logger.Info("WebSocket连接成功")
 
 	// 启动消息处理协程
@@ -128,15 +171,15 @@ func (ws *WebSocketClient) Connect() error {
 // Close 关闭WebSocket连接
 func (ws *WebSocketClient) Close() error {
 	ws.cancel()
-	
+
 	if ws.heartbeatTicker != nil {
 		ws.heartbeatTicker.Stop()
 	}
-	
+
 	if ws.conn != nil {
 		return ws.conn.Close()
 	}
-	
+
 	return nil
 }
 
@@ -146,6 +189,14 @@ func (ws *WebSocketClient) handleMessages() {
 		if r := recover(); r != nil {
 			ws.client.logger.Errorf("WebSocket消息处理发生panic: %v", r)
 		}
+
+		// 标记连接已断开
+		ws.connMu.Lock()
+		ws.isConnected = false
+		ws.connMu.Unlock()
+
+		// 尝试重连
+		ws.attemptReconnect()
 	}()
 
 	for {
@@ -153,7 +204,16 @@ func (ws *WebSocketClient) handleMessages() {
 		case <-ws.ctx.Done():
 			return
 		default:
-			_, data, err := ws.conn.ReadMessage()
+			ws.connMu.RLock()
+			conn := ws.conn
+			ws.connMu.RUnlock()
+
+			if conn == nil {
+				ws.client.logger.Error("WebSocket连接为空")
+				return
+			}
+
+			_, data, err := conn.ReadMessage()
 			if err != nil {
 				ws.client.logger.WithError(err).Error("读取WebSocket消息失败")
 				return
@@ -183,6 +243,37 @@ func (ws *WebSocketClient) handleMessages() {
 	}
 }
 
+// attemptReconnect 尝试重连
+func (ws *WebSocketClient) attemptReconnect() {
+	if ws.reconnectCount >= ws.maxReconnects {
+		ws.client.logger.Error("已达到最大重连次数，停止重连")
+		return
+	}
+
+	ws.reconnectCount++
+	ws.client.logger.Infof("开始第 %d 次重连尝试", ws.reconnectCount)
+
+	// 等待一段时间后重连
+	time.Sleep(ws.reconnectDelay * time.Duration(ws.reconnectCount))
+
+	err := ws.doConnect()
+	if err != nil {
+		ws.client.logger.WithError(err).Errorf("重连失败")
+		// 递归尝试重连
+		go ws.attemptReconnect()
+	} else {
+		ws.client.logger.Info("重连成功")
+		ws.reconnectCount = 0
+	}
+}
+
+// IsConnected 检查连接状态
+func (ws *WebSocketClient) IsConnected() bool {
+	ws.connMu.RLock()
+	defer ws.connMu.RUnlock()
+	return ws.isConnected
+}
+
 // handleMessage 处理单个WebSocket消息
 func (ws *WebSocketClient) handleMessage(msg *WebSocketMessage) error {
 	switch msg.S {
@@ -201,10 +292,23 @@ func (ws *WebSocketClient) handleMessage(msg *WebSocketMessage) error {
 	case SignalResumeAck:
 		// 处理重连确认消息
 		return ws.handleResumeAck(msg)
+	case SignalPong:
+		// 处理Pong消息
+		var pong PongMessage
+		if msg.D != nil {
+			if err := json.Unmarshal(msg.D, &pong); err != nil {
+				ws.client.logger.WithError(err).Debug("解析Pong消息失败，可能是空的Pong")
+			} else {
+				ws.client.logger.Debugf("收到Pong响应，SN: %d", pong.SN)
+			}
+		} else {
+			ws.client.logger.Debug("收到Pong响应")
+		}
+		return nil
 	default:
 		ws.client.logger.Warnf("收到未知信令类型: %d", msg.S)
 	}
-	
+
 	return nil
 }
 
@@ -275,7 +379,7 @@ func (ws *WebSocketClient) handlePing(msg *WebSocketMessage) error {
 // handleReconnect 处理重连消息
 func (ws *WebSocketClient) handleReconnect(msg *WebSocketMessage) error {
 	ws.client.logger.Warn("服务器要求重连")
-	
+
 	// 发送Resume消息
 	resume := WebSocketMessage{
 		S: SignalResume,
@@ -300,13 +404,16 @@ func (ws *WebSocketClient) handleResumeAck(msg *WebSocketMessage) error {
 func (ws *WebSocketClient) startHeartbeat() {
 	// 每30秒发送一次心跳
 	ws.heartbeatTicker = time.NewTicker(30 * time.Second)
-	
+
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
 				ws.client.logger.Errorf("心跳处理发生panic: %v", r)
 			}
 		}()
+
+		consecutiveFailures := 0
+		const maxFailures = 3
 
 		for {
 			select {
@@ -321,7 +428,25 @@ func (ws *WebSocketClient) startHeartbeat() {
 				ping.D = pingData
 
 				if err := ws.sendMessage(&ping); err != nil {
-					ws.client.logger.WithError(err).Error("发送心跳失败")
+					consecutiveFailures++
+					ws.client.logger.WithError(err).Errorf("发送心跳失败 (%d/%d)", consecutiveFailures, maxFailures)
+
+					if consecutiveFailures >= maxFailures {
+						ws.client.logger.Error("连续心跳失败，触发重连")
+						ws.connMu.Lock()
+						ws.isConnected = false
+						if ws.conn != nil {
+							ws.conn.Close()
+						}
+						ws.connMu.Unlock()
+						go ws.attemptReconnect()
+						return
+					}
+				} else {
+					if consecutiveFailures > 0 {
+						ws.client.logger.Info("心跳恢复正常")
+					}
+					consecutiveFailures = 0
 				}
 			}
 		}
@@ -349,4 +474,4 @@ func (ws *WebSocketClient) decompress(data []byte) ([]byte, error) {
 	defer r.Close()
 
 	return io.ReadAll(r)
-} 
+}

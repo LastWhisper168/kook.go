@@ -34,11 +34,13 @@ const (
 
 // Client KOOK API客户端
 type Client struct {
-	httpClient *http.Client
-	token      string
-	tokenType  TokenType
-	baseURL    string
-	logger     *logrus.Logger
+	httpClient  *http.Client
+	token       string
+	tokenType   TokenType
+	baseURL     string
+	logger      *logrus.Logger
+	rateLimiter *GlobalRateLimiter
+	retryConfig *RetryConfig
 
 	// API服务
 	User      *UserService
@@ -98,6 +100,34 @@ func WithLogger(logger *logrus.Logger) ClientOption {
 	}
 }
 
+// WithRateLimiter 设置自定义速率限制器
+func WithRateLimiter(rateLimiter *GlobalRateLimiter) ClientOption {
+	return func(c *Client) {
+		c.rateLimiter = rateLimiter
+	}
+}
+
+// WithoutRateLimit 禁用速率限制
+func WithoutRateLimit() ClientOption {
+	return func(c *Client) {
+		c.rateLimiter = nil
+	}
+}
+
+// WithRetryConfig 设置自定义重试配置
+func WithRetryConfig(config *RetryConfig) ClientOption {
+	return func(c *Client) {
+		c.retryConfig = config
+	}
+}
+
+// WithoutRetry 禁用重试
+func WithoutRetry() ClientOption {
+	return func(c *Client) {
+		c.retryConfig = &RetryConfig{MaxRetries: 0}
+	}
+}
+
 // NewClient 创建新的KOOK客户端
 func NewClient(token string, options ...ClientOption) *Client {
 	if token == "" {
@@ -118,11 +148,13 @@ func NewClient(token string, options ...ClientOption) *Client {
 	})
 
 	client := &Client{
-		httpClient: httpClient,
-		token:      token,
-		tokenType:  TokenTypeBot,
-		baseURL:    BaseURL,
-		logger:     logger,
+		httpClient:  httpClient,
+		token:       token,
+		tokenType:   TokenTypeBot,
+		baseURL:     BaseURL,
+		logger:      logger,
+		rateLimiter: NewGlobalRateLimiter(),
+		retryConfig: DefaultRetryConfig(),
 	}
 
 	// 应用选项
@@ -161,14 +193,25 @@ func NewClient(token string, options ...ClientOption) *Client {
 
 // buildURL 构建完整的API URL
 func (c *Client) buildURL(endpoint string) string {
-	if strings.HasPrefix(endpoint, "/") {
-		endpoint = endpoint[1:]
-	}
+	endpoint = strings.TrimPrefix(endpoint, "/")
 	return fmt.Sprintf("%s/%s/%s", c.baseURL, Version, endpoint)
 }
 
 // doRequest 执行HTTP请求
 func (c *Client) doRequest(method, endpoint string, params map[string]interface{}, query map[string]string) (*Response, error) {
+	// 使用重试机制执行请求
+	return DoWithRetry(func() (*Response, error) {
+		return c.doSingleRequest(method, endpoint, params, query)
+	}, c.retryConfig, c.logger)
+}
+
+// doSingleRequest 执行单次HTTP请求
+func (c *Client) doSingleRequest(method, endpoint string, params map[string]interface{}, query map[string]string) (*Response, error) {
+	// 应用速率限制
+	if c.rateLimiter != nil {
+		c.rateLimiter.Wait(endpoint)
+	}
+
 	requestURL := c.buildURL(endpoint)
 
 	// 添加查询参数
@@ -177,7 +220,7 @@ func (c *Client) doRequest(method, endpoint string, params map[string]interface{
 		if err != nil {
 			return nil, fmt.Errorf("解析URL失败: %w", err)
 		}
-		
+
 		q := u.Query()
 		for k, v := range query {
 			q.Set(k, v)
@@ -210,9 +253,9 @@ func (c *Client) doRequest(method, endpoint string, params map[string]interface{
 	req.Header.Set("Accept-Language", "zh-cn")
 
 	c.logger.WithFields(logrus.Fields{
-		"method":   method,
-		"url":      requestURL,
-		"headers":  req.Header,
+		"method":  method,
+		"url":     requestURL,
+		"headers": req.Header,
 	}).Debugf("发送API请求")
 
 	// 执行请求
@@ -244,10 +287,23 @@ func (c *Client) doRequest(method, endpoint string, params map[string]interface{
 
 	// 检查API错误
 	if response.Code != 0 {
-		err := &APIError{
-			Code:    response.Code,
-			Message: response.Message,
+		err := NewKOOKError(response.Code, response.Message).
+			WithContext(method, endpoint)
+
+		// 从响应头中提取请求ID
+		if requestID := resp.Header.Get("X-Request-Id"); requestID != "" {
+			err = err.WithRequestID(requestID)
 		}
+
+		// 从响应头中提取重试延迟
+		if retryAfter := resp.Header.Get("Retry-After"); retryAfter != "" {
+			if seconds, parseErr := time.ParseDuration(retryAfter + "s"); parseErr == nil {
+				err = err.WithRetryAfter(seconds)
+			}
+		}
+
+		err.HTTPStatus = resp.StatusCode
+
 		c.logger.WithError(err).Errorf("API返回错误")
 		return &response, err
 	}
@@ -282,21 +338,3 @@ type Response struct {
 	Message string          `json:"message"`
 	Data    json.RawMessage `json:"data"`
 }
-
-// APIError API错误
-type APIError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
-}
-
-func (e *APIError) Error() string {
-	return fmt.Sprintf("KOOK API错误 [%d]: %s", e.Code, e.Message)
-}
-
-// IsAPIError 检查是否为API错误
-func IsAPIError(err error) (*APIError, bool) {
-	if apiErr, ok := err.(*APIError); ok {
-		return apiErr, true
-	}
-	return nil, false
-} 

@@ -9,13 +9,15 @@
 
 ## 功能特性
 
-- 完整的 KOOK API v3 支持
-- 自动处理 Token 身份验证
-- 完善的错误日志记录和处理
-- 支持 WebSocket 和 Webhook
-- 速率限制管理
-- 类型安全的 API 调用
-- 详细的文档和示例代码
+- **完整的 KOOK API v3 支持** - 覆盖24个主要API服务
+- **自动处理 Token 身份验证** - 支持 Bot 和 Bearer 两种认证方式
+- **完善的错误处理机制** - 增强的错误类型和详细错误信息
+- **WebSocket 实时连接** - 支持自动重连、心跳监控和断线恢复
+- **智能速率限制管理** - 全局和端点级别的令牌桶算法
+- **自动请求重试机制** - 支持指数退避和可配置重试策略
+- **类型安全的 API 调用** - 完整的类型定义和参数验证
+- **全面的单元测试** - 核心功能测试覆盖
+- **详细的文档和示例代码** - 5个不同场景的完整示例
 
 ## 安装
 
@@ -164,26 +166,76 @@ message, err := client.Message.SendMessage(kook.SendMessageParams{
 })
 ```
 
-## 配置选项
+## 高级配置
 
-### 客户端配置
+### 生产环境配置
 
 ```go
-// 使用自定义选项创建客户端
+// 生产环境推荐配置
 client := kook.NewClient("你的机器人令牌",
-    kook.WithHTTPClient(&http.Client{Timeout: 30 * time.Second}),
-    kook.WithTokenType(kook.TokenTypeBot),
-    kook.WithBaseURL("https://www.kookapp.cn/api"),
+    // 自定义HTTP客户端
+    kook.WithHTTPClient(&http.Client{
+        Timeout: 30 * time.Second,
+        Transport: &http.Transport{
+            MaxIdleConns:        100,
+            MaxIdleConnsPerHost: 10,
+        },
+    }),
+    // 自定义重试配置
+    kook.WithRetryConfig(&kook.RetryConfig{
+        MaxRetries:    5,
+        InitialDelay:  1 * time.Second,
+        MaxDelay:      30 * time.Second,
+        BackoffFactor: 2.0,
+    }),
+    // 自定义速率限制
+    kook.WithRateLimiter(kook.NewGlobalRateLimiter()),
+    // 自定义日志器
     kook.WithLogger(customLogger),
 )
 ```
 
-### WebSocket 配置
+### WebSocket 高级配置
 
 ```go
-// 创建启用压缩的 WebSocket 客户端
-wsClient := kook.NewWebSocketClient(client, true) // true = 启用压缩
+// 创建高可用的WebSocket客户端
+wsClient := kook.NewWebSocketClient(client, true) // 启用压缩
+
+// 监控连接状态
+go func() {
+    for {
+        if !wsClient.IsConnected() {
+            log.Println("WebSocket连接已断开，正在重连...")
+        }
+        time.Sleep(30 * time.Second)
+    }
+}()
 ```
+
+### 错误处理最佳实践
+
+```go
+user, err := client.User.GetMe()
+if err != nil {
+    if kookErr, ok := kook.IsKOOKError(err); ok {
+        switch {
+        case kookErr.IsAuthError():
+            log.Fatal("认证失败，请检查Token")
+        case kookErr.IsRateLimited():
+            log.Printf("请求被限流，请等待 %v", kookErr.RetryAfter)
+        case kookErr.IsServerError():
+            log.Printf("服务器错误，将自动重试")
+        default:
+            log.Printf("API错误: %s", kookErr.Error())
+        }
+    } else {
+        log.Printf("网络错误: %v", err)
+    }
+    return
+}
+```
+
+
 
 ## API 覆盖范围
 
